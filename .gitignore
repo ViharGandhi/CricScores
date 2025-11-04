@@ -1,0 +1,14 @@
+# Node dependencies
+node_modules/
+
+# Environment variables
+.env
+
+# API session data
+session.txt
+
+# Gemini or other AI helper scripts you don’t want tracked
+gemini.js
+
+# Lock file (optional – if you don’t want to commit exact versions)
+package-lock.json
