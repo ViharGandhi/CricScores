@@ -1,5 +1,6 @@
 // telegram-group-listener.js
 // Logs in, connects, and processes messages from one Telegram group/channel using Gemini AI
+// WITH SEQUENTIAL MESSAGE PROCESSING QUEUE
 
 import { TelegramClient } from "telegram";
 import { StringSession } from "telegram/sessions/index.js";
@@ -16,16 +17,13 @@ const apiId = Number(process.env.API_ID);
 const apiHash = process.env.API_HASH;
 const sessionFile = "./session.txt";
 
-// For private channels without names, we'll find it by listing all channels
-// Set this to true for first run to see all your channels and get the ID
-const LIST_ALL_CHANNELS = false
-// Once you know the channel ID, set it here and change LIST_ALL_CHANNELS to false
-const TARGET_CHANNEL_ID = 1736810240; // Will be set after first run
+const LIST_ALL_CHANNELS = false;
+const TARGET_CHANNEL_ID = 1736810240;
 
 const scorecard = {
-  runs: 164,
-  over: 19.4,
-  wicket: 8,
+  runs: 68,
+  over: 9,
+  wicket:2,
   onstrike: 0
 };
 
@@ -33,13 +31,120 @@ const ai = new GoogleGenAI({
   apiKey: process.env.GOOGLE_API_KEY
 });
 
-const systemPrompt = `You are a structured data extractor for live cricket commentary messages.
-You will receive raw Telegram messages containing cricket score updates.
-Your goal is to extract meaningful scoring or wicket events, extras, or free hits.`;
+// ============================================================================
+// MESSAGE QUEUE FOR SEQUENTIAL PROCESSING
+// ============================================================================
+
+class MessageQueue {
+  constructor() {
+    this.queue = [];
+    this.processing = false;
+  }
+
+  async add(message) {
+    this.queue.push(message);
+    console.log(`📥 Message queued. Queue size: ${this.queue.length}`);
+    
+    if (!this.processing) {
+      await this.processNext();
+    }
+  }
+
+  async processNext() {
+    if (this.queue.length === 0) {
+      this.processing = false;
+      return;
+    }
+
+    this.processing = true;
+    const message = this.queue.shift();
+    
+    console.log(`\n📩 Processing message from queue (${this.queue.length} remaining):`);
+    console.log(message);
+    console.log("----------------------");
+
+    // Process with Gemini
+    console.log("🤖 Processing with Gemini AI...");
+    const startTime = Date.now();
+    const geminiOutput = await processWithGemini(message);
+    const endTime = Date.now();
+    console.log(`⏱️  Processing time: ${endTime - startTime}ms`);
+
+    if (geminiOutput) {
+      console.log("✅ Gemini Analysis:");
+      console.log(geminiOutput);
+
+      // Parse JSON and update scorecard
+      try {
+        const data = typeof geminiOutput === 'string'
+          ? JSON.parse(geminiOutput.replace(/```json\n?/g, '').replace(/```\n?/g, ''))
+          : geminiOutput;
+
+        if (data.ignore) {
+          console.log("⏭️  Message ignored, no scorecard update");
+          console.log(scorecard);
+        } else {
+          updateScorecard(data);
+          console.log("📊 Updated Scorecard:");
+          console.log(scorecard);
+        }
+      } catch (error) {
+        console.error("❌ Error updating scorecard:", error.message);
+      }
+    }
+
+    // Process next message in queue
+    await this.processNext();
+  }
+}
+
+const messageQueue = new MessageQueue();
+
+// ============================================================================
+// SCORECARD UPDATE FUNCTION
+// ============================================================================
+
+function updateScorecard(data) {
+  // Update wickets
+  if (data.wicket === true) {
+    scorecard.wicket += 1;
+    scorecard.wicket = scorecard.wicket % 11;
+  }
+
+  // Update runs and handle strike rotation
+  let last_scorecard = scorecard.runs;
+  scorecard.runs += data.runs_off_bat + data.extra_runs;
+  let rotationRuns = scorecard.runs;
+  
+  // -1 because the run that came from the wide and no ball is not counted 
+  if (data.extra_type === "wide" || data.extra_type === "no_ball") {
+    rotationRuns -= 1;
+  }
+  
+  // Simple direct logic: if runs are odd the striker changes
+  if ((rotationRuns - last_scorecard) % 2 !== 0 && rotationRuns - last_scorecard !== 0) {
+    scorecard.onstrike = scorecard.onstrike ^ 1;
+  }
+
+  // Update overs (only for legal deliveries)
+  if (data.extra_type !== "wide" && data.extra_type !== "no_ball") {
+    const currentBalls = Math.round((scorecard.over % 1) * 10);
+    if (currentBalls === 5) {
+      scorecard.over = Math.floor(scorecard.over) + 1.0;
+      scorecard.onstrike = scorecard.onstrike ^ 1;
+    } else {
+      scorecard.over = Math.floor(scorecard.over) + (currentBalls + 1) / 10;
+    }
+  }
+}
 
 // ============================================================================
 // GEMINI PROCESSING FUNCTION
 // ============================================================================
+
+const systemPrompt = `You are a structured data extractor for live cricket commentary messages.
+You will receive raw Telegram messages containing cricket score updates.
+Your goal is to extract meaningful scoring or wicket events, extras, or free hits.`;
 
 async function processWithGemini(message) {
   const fullPrompt = `${systemPrompt}
@@ -71,6 +176,8 @@ Rules:
 - also a little for any no ball and more runs from it will be assumed to be coming from bat and hence we update runs_off_bat ok so if no ball + 3 will be 3 in runs_off_bat and 1 in extra 
 - wicket will be only if it there is a word wicket or anything like wkt or wicket or any context to it dont assume it ok 
 - if players name appear with emoji ignore them 
+- Ignore any messages containing country flags (🇦🇺, 🇮🇳, etc.) or team names with numbers, as these are betting odds or advertisements, not ball-by-ball scoring events.
+
 Example:
 Input: "NO BALL ☄️ +3 🏏 FREE HIT "
 Output:
@@ -122,7 +229,6 @@ const stringSession = new StringSession(savedSession);
     connectionRetries: 5,
   });
 
-  // Login flow (first time only)
   if (!savedSession) {
     console.log("No saved session found — starting login process...");
     await client.start({
@@ -140,7 +246,6 @@ const stringSession = new StringSession(savedSession);
     console.log("✅ Connected using saved session.");
   }
 
-  // Get all dialogs (chats/channels you're part of)
   console.log("Fetching your channels...");
   const dialogs = await client.getDialogs({ limit: 100 });
   
@@ -168,14 +273,13 @@ const stringSession = new StringSession(savedSession);
     console.log("\n⚠️  SETUP REQUIRED:");
     console.log("1. Find your cricket channel from the list above");
     console.log("2. Copy its Channel ID");
-    console.log("3. Set TARGET_CHANNEL_ID in the code to that ID (as a string)");
+    console.log("3. Set TARGET_CHANNEL_ID in the code to that ID");
     console.log("4. Change LIST_ALL_CHANNELS to false");
     console.log("5. Run the script again\n");
     
     process.exit(0);
   }
   
-  // Find the target channel by ID
   target = dialogs.find(d => 
     d.isChannel && d.entity.id.toString() === TARGET_CHANNEL_ID.toString()
   )?.entity;
@@ -191,7 +295,7 @@ const stringSession = new StringSession(savedSession);
   console.log(`   Channel ID: ${target.id}`);
 
   // ============================================================================
-  // EVENT HANDLER - Listen for new messages
+  // EVENT HANDLER - Add messages to queue instead of processing directly
   // ============================================================================
 
   client.addEventHandler(async (update) => {
@@ -204,83 +308,13 @@ const stringSession = new StringSession(savedSession);
     const peerUserId = peer?.userId?.valueOf?.();
     const targetId = target.id?.valueOf?.();
 
-    // Only process if message belongs to the target entity
     if (peerChannelId === targetId || peerChatId === targetId || peerUserId === targetId) {
-      console.log("📩 New message from target channel:");
-      console.log(msg.message);
-      console.log("----------------------");
-
-      // Process with Gemini
-      console.log("🤖 Processing with Gemini AI...");
-      let seconds = Date.now();   
-      const geminiOutput = await processWithGemini(msg.message);
-      let after = Date.now();
-      console.log(`⏱️  Processing time: ${after-seconds}ms`);
-
-      if (geminiOutput) {
-        console.log("✅ Gemini Analysis:");
-        console.log(geminiOutput);
-
-        // Parse JSON and update scorecard
-        try {
-          // Parse the JSON output from Gemini
-          const data = typeof geminiOutput === 'string'
-            ? JSON.parse(geminiOutput.replace(/```json\n?/g, '').replace(/```\n?/g, ''))
-            : geminiOutput;
-
-          // If message should be ignored, don't update
-          if (data.ignore) {
-            console.log("⏭️  Message ignored, no scorecard update");
-            console.log(scorecard);
-            return;
-          }
-
-          // Update wickets
-          if (data.wicket == true) {
-            scorecard.wicket += 1;
-            scorecard.wicket = scorecard.wicket % 11;
-          }
-
-          // Update runs and handle strike rotation
-          let last_scorecard = scorecard.runs;
-          scorecard.runs += data.runs_off_bat + data.extra_runs;
-          let rotationRuns = scorecard.runs;
-          
-          // -1 because the run that came from the wide and no ball is not counted 
-          if (data.extra_type == "wide" || data.extra_type == "no_ball") {
-            rotationRuns -= 1;
-          }
-          
-          // Simple direct logic: if runs are odd the striker changes
-          // Also handle edge case: no strike rotation for dot ball
-          if ((rotationRuns - last_scorecard) % 2 != 0 && rotationRuns - last_scorecard != 0) {
-            scorecard.onstrike = scorecard.onstrike ^ 1;
-          }
-
-          // Update overs (only for legal deliveries)
-          if (data.extra_type !== "wide" && data.extra_type !== "no_ball") {
-            // Increment ball count
-            const currentBalls = Math.round((scorecard.over % 1) * 10);
-            if (currentBalls === 5) {
-              // Complete over
-              scorecard.over = Math.floor(scorecard.over) + 1.0;
-              scorecard.onstrike = scorecard.onstrike ^ 1; // Strike change on over complete 
-            } else {
-              // Add one ball
-              scorecard.over = Math.floor(scorecard.over) + (currentBalls + 1) / 10;
-            }
-          }
-
-          console.log("📊 Updated Scorecard:");
-          console.log(scorecard);
-
-        } catch (error) {
-          console.error("❌ Error updating scorecard:", error.message);
-        }
-      }
+      // Add to queue instead of processing immediately
+      await messageQueue.add(msg.message);
     }
   });
 
   console.log(`\n🎧 Listening for new messages from channel ID: ${target.id}...`);
+  console.log("📋 Messages will be processed sequentially in order.");
   console.log("Press Ctrl+C to stop.\n");
 })();
